@@ -1,0 +1,27 @@
+; ---------------------------------------------------------------------------
+; WS2812 / NeoPixel driver (single-wire, 800 kHz bit stream)
+;
+; Bit period = T1 + T2 + T3 cycles = 10 cycles.
+;   '1' -> high for T1 + T2 = 7 cycles, low for T3 = 3 cycles
+;   '0' -> high for T1     = 2 cycles, low for T2 + T3 = 8 cycles
+; With a 125 MHz sys_clk the clock divider in main.c yields an 800 kHz bit rate
+; (1.25 us/bit, 250 ns / 875 ns high times).
+;
+; The side-set pin is the NeoPixel data line.
+; ---------------------------------------------------------------------------
+.program ws2812
+.side_set 1
+
+.define public T1 2
+.define public T2 5
+.define public T3 3
+
+.wrap_target
+bitloop:
+    out x, 1       side 0 [T3 - 1]  ; Shift out one bit, drive low for the tail
+    jmp !x do_zero side 1 [T1 - 1]  ; Branch on the bit, start the high pulse
+do_one:
+    jmp  bitloop   side 1 [T2 - 1]  ; Long high pulse for a '1'
+do_zero:
+    nop            side 0 [T2 - 1]  ; Short high pulse for a '0'
+.wrap
