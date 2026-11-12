@@ -180,10 +180,19 @@ USB (5 V, power header pin 3) ──[100k]──┬── A0 / GP26
                                      GND
 ```
 
-Then uncomment `#define USB_POWER_SENSE_PIN 26` at the top of `main.c`.
-`A0` reads ~2.5 V on USB-C power and 0 V on battery (threshold 1.2 V), and the
-`s` console key reports `USB pwr 1|0`. Do not enable it on an unmodified board:
-a floating `A0` reads noise and the board would never sleep.
+`USB_POWER_SENSE_PIN 26` is defined at the top of `main.c`; comment it out on a
+board without the divider (a floating `A0` reads noise and the board would never
+sleep). With the 100 k/100 k divider above, the firmware reads **~2420 mV** at
+`A0` on USB-C power and 0 V on battery; the threshold is 300 mV, deliberately
+far from both so the absolute value does not matter. The `s` console key reports
+`USB pwr 1|0` together with the measured millivolts:
+
+```
+Host up | D+=1 D-=1 | MSC none addr 0 | state 0 | boot sense D+=0 D-=0 | USB pwr 1 (2424 mV)
+```
+
+A meter on that node reads low (the divider is high impedance); trust the
+firmware's ADC reading instead.
 
 Note `BAT` is *not* usable for this: it sits at 3.0–4.2 V whether or not USB-C is
 plugged in, and only moves while the cell is actually charging.

@@ -106,6 +106,8 @@ target_link_libraries(feather_usb_cleaner PRIVATE
         hardware_pll
         hardware_xosc
         hardware_rosc
+        # Optional ADC-based USB-C power sense (see USB_POWER_SENSE_PIN)
+        hardware_adc
 )
 
 # Console on the native USB-C port (CDC-ACM), no UART pins needed.

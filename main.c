@@ -150,16 +150,19 @@
 // Optional hardware: this board wires USB-C VBUS only to the charger and the
 // load-share FET, so there is nothing to *see* USB-C power from the RP2040. The
 // most it can tell is "a USB host enumerated me", which misses dumb chargers.
-// Fit a 2x100k divider from the Feather's USB (VBUS) pin to A0 and define the
-// pin below to sense real USB-C power (2.5 V on USB, 0 V on battery). Leave it
-// undefined on an unmodified board: a floating A0 reads noise, and that would
-// keep the board awake forever.
-// #define USB_POWER_SENSE_PIN 26 // A0
+// With a divider from the Feather's USB (VBUS) pin to A0 the firmware can sense
+// real USB-C power, dumb brick included. Comment the pin out on an unmodified
+// board: a floating A0 reads noise and would keep the board awake forever.
+#define USB_POWER_SENSE_PIN 26 // A0
 
 #ifdef USB_POWER_SENSE_PIN
 #include "hardware/adc.h"
 #define USB_POWER_SENSE_ADC_INPUT 0
-#define USB_POWER_SENSE_THRESHOLD 1500u // ~1.2 V of 3.3 V over 4095
+// Threshold at the pin, in millivolts. Any ratio works as long as it lifts the
+// pin clearly off 0 V: with this board's divider A0 sits at ~825 mV on a 5 V
+// source and at 0 V on battery, so 300 mV has plenty of margin for sag and
+// noise. Do not trust the absolute value - read it with the 's' key.
+#define USB_POWER_SENSE_THRESHOLD_MV 300u
 #endif
 
 // How long the boot-time bus sense waits for a drive to show its pull-up after
@@ -965,10 +968,12 @@ static void usb_power_sense_init(void) {
 #endif
 }
 
-// True when the board is running from USB-C. Without the optional ADC divider
-// the best we can do is "a USB host enumerated us" (PC, laptop, powered hub) or
-// an open console - a dumb charger is invisible, and the board powers down on
-// it just like on battery.
+// Last reading of the USB-power divider, in millivolts (0 when there is no
+// divider fitted). Reported by the 's' key.
+static uint32_t usb_power_sense_mv = 0;
+
+// True when the board is running from USB-C: the divider says so, or a USB host
+// enumerated us (PC, laptop, powered hub), or a console is open.
 static bool usb_power_present(void) {
 #ifdef USB_POWER_SENSE_PIN
   adc_select_input(USB_POWER_SENSE_ADC_INPUT);
@@ -976,7 +981,8 @@ static bool usb_power_present(void) {
   for (int i = 0; i < 4; i++) {
     sum += adc_read();
   }
-  if ((sum / 4u) > USB_POWER_SENSE_THRESHOLD) {
+  usb_power_sense_mv = ((sum / 4u) * 3300u) / 4095u;
+  if (usb_power_sense_mv > USB_POWER_SENSE_THRESHOLD_MV) {
     return true;
   }
 #endif
@@ -1159,14 +1165,15 @@ static void console_service(void) {
     // Raw bus state: if D+ is high the drive is powered and pulling up, so a
     // missing mount means enumeration failed; a low D+ means nothing is there
     // (no power, bad contact, or no device).
-    printf("Host %s | D+=%u D-=%u | MSC %s addr %u | state %d | boot sense D+=%u D-=%u | USB pwr %u\n",
+    const bool usb_pwr = usb_power_present(); // also refreshes the mV reading
+    printf("Host %s | D+=%u D-=%u | MSC %s addr %u | state %d | boot sense D+=%u D-=%u | USB pwr %u (%lu mV)\n",
            tuh_inited() ? "up" : "down",
            (unsigned)gpio_get(BOARD_USB_HOST_DP_PIN),
            (unsigned)gpio_get(BOARD_USB_HOST_DM_PIN),
            (msc_dev_addr != 0 && tuh_msc_mounted(msc_dev_addr)) ? "mounted" : "none",
            (unsigned)msc_dev_addr, (int)wipe_state,
            (unsigned)sense_dp_high, (unsigned)sense_dm_high,
-           (unsigned)usb_power_present());
+           (unsigned)usb_pwr, (unsigned long)usb_power_sense_mv);
     return;
   }
 
