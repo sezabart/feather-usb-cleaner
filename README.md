@@ -176,6 +176,7 @@ restores upstream behaviour.
 | Blue blinking | Writing the new file system |
 | Green solid | Done: cache flushed, structures verified |
 | Magenta blinking | Heads-up: drive is larger than 32 GiB, writing starts next |
+| Red blinking | A drive is attached but never enumerated (unsupported drive) |
 | Red solid | Error: block size, write failure, verification failure, timeout |
 | Off | Powered down: dormant, NeoPixel and USB-A rails off (press RESET) |
 
@@ -289,6 +290,7 @@ starts. A stick that rejects `SYNCHRONIZE CACHE` is only a warning: the
 |---|---|
 | ENTER | Re-run sanitize on the inserted stick |
 | `t` | Read 1 MiB and report raw read throughput |
+| `s` | Dump host state: `D+`/`D-`, mount, state machine, boot-time bus sense |
 | `p` | Power-cycle the USB-A port (recover a wedged stick) |
 | `b` | Reboot into BOOTSEL |
 
@@ -322,6 +324,8 @@ At the top of `main.c`:
 | `LARGE_DRIVE_BYTES` | 32 GiB | Above this the magenta heads-up is shown first |
 | `LARGE_NOTICE_MS` | 2000 | How long that heads-up lasts before writing |
 | `IDLE_SLEEP_MS` | 5000 | Awake time with nothing mounted before powering down |
+| `NO_ENUM_MS` | 4000 | How long an attached drive gets to enumerate before it counts as unsupported |
+| `BUS_SENSE_MS` | 400 | Boot-time wait for a drive's pull-up after the port powers up |
 | `RESULT_HOLD_MS` | 2500 | How long the result colour stays on before powering down |
 | `CONSOLE_WAIT_MS` | 1500 | Boot-time wait for the USB-C console to attach |
 | `CHUNK_BYTES` | 32 KiB | Bytes per `WRITE(10)`; must stay ≤ 65535 |
@@ -350,6 +354,12 @@ Cluster size is picked in `fat32_builder.c` (`fat32_plan`) from the device size.
   counts. Anything bigger is out of scope for this firmware.
 * One drive at a time; a second MSC device behind a hub is ignored while a
   sanitize run is in progress.
+* A drive whose controller does not complete enumeration shows **red blinking**
+  and is left untouched. Seen with an old 16 GB Alcor Micro stick that works on
+  a PC: it presents a valid full-speed pull-up (`D+` high, sensed at boot by
+  `s`), but the PIO-USB host never gets an answer out of it. Out of ~8 attempts
+  it enumerated once and then the first `WRITE(10)` timed out. That is a host /
+  controller compatibility problem, not a file-system or size problem.
 * Powering down is total: the USB-A rail is off, so **inserting a drive does
   not wake the board** — press RESET after inserting one.
 * DORMANT still draws ~1–2 mA (SRAM retention); the RP2040 cannot switch itself

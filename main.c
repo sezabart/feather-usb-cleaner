@@ -143,6 +143,14 @@
 // Covers the enumeration of a drive that is already plugged in at boot.
 #define IDLE_SLEEP_MS 5000u
 
+// How long a drive that is already attached at boot gets to enumerate before we
+// call it unrecognised.
+#define NO_ENUM_MS 4000u
+
+// How long the boot-time bus sense waits for a drive to show its pull-up after
+// it sees VBUS. Older drives are slow to start.
+#define BUS_SENSE_MS 400u
+
 // How long to wait for the USB-C console to attach at boot, so the banner is
 // not printed into the void on a workbench. Costs the same on every battery
 // wake, so keep it small.
@@ -157,6 +165,7 @@ typedef enum {
   STATUS_WIPING,   // blue blinking
   STATUS_DONE,     // green solid
   STATUS_LARGE,    // magenta blinking: drive over LARGE_DRIVE_BYTES
+  STATUS_UNRECOGNISED, // red blinking: drive attached, never enumerated
   STATUS_ERROR,    // red solid
 } status_t;
 
@@ -261,6 +270,14 @@ static void status_led_task(void) {
       break;
     }
 
+    case STATUS_UNRECOGNISED: {
+      // Blinking red: something is plugged in, but it never answered the host.
+      const bool on = ((now_ms / 250u) & 1u) != 0;
+      r = on ? 255 : 0;
+      led_on = on;
+      break;
+    }
+
     case STATUS_ERROR:
       r = 255;
       led_on = true;
@@ -312,6 +329,7 @@ static volatile xfer_state_t xfer_state = XFER_IDLE;
 static volatile uint32_t state_since_us = 0;
 
 // Written by the TinyUSB host callbacks, consumed by the main loop.
+static volatile uint8_t pending_attach_addr = 0;
 static volatile uint8_t pending_mount_addr = 0;
 static volatile uint8_t pending_umount_addr = 0;
 static volatile uint8_t last_csw_status = 0;
@@ -320,6 +338,12 @@ static volatile uint32_t last_csw_residue = 0;
 static uint8_t msc_dev_addr = 0;
 static uint32_t msc_block_size = 0;
 static uint32_t msc_block_count = 0;
+
+// A drive was already showing its pull-up when the port came up at boot, and
+// which line it used (the host decides full-speed vs low-speed from that).
+static bool device_at_boot = false;
+static bool sense_dp_high = false;
+static bool sense_dm_high = false;
 
 static fat32_layout_t fs_layout;
 static uint32_t fs_region_sectors = 0; // reserved + FAT + root dir cluster
@@ -489,9 +513,11 @@ void tuh_msc_umount_cb(uint8_t dev_addr) {
   }
 }
 
-// Optional generic callbacks (weak in TinyUSB, just for visibility).
+// Generic callbacks (weak in TinyUSB): they fire for *any* device that finishes
+// enumeration, not just mass storage. Recorded and printed from the main loop,
+// because printing here would pump tud_task() from inside tuh_task().
 void tuh_mount_cb(uint8_t dev_addr) {
-  (void)dev_addr;
+  pending_attach_addr = dev_addr;
 }
 
 void tuh_umount_cb(uint8_t dev_addr) {
@@ -604,6 +630,14 @@ static void wipe_finish(void) {
 
 static void wipe_service(void) {
   // Consume events recorded by the TinyUSB callbacks.
+  if (pending_attach_addr != 0) {
+    const uint8_t addr = pending_attach_addr;
+    pending_attach_addr = 0;
+    uint16_t vid = 0, pid = 0;
+    tuh_vid_pid_get(addr, &vid, &pid);
+    printf("USB device attached at address %u (VID %04X PID %04X)\n",
+           (unsigned)addr, (unsigned)vid, (unsigned)pid);
+  }
   if (pending_mount_addr != 0) {
     const uint8_t addr = pending_mount_addr;
     pending_mount_addr = 0;
@@ -893,6 +927,22 @@ static void power_off(void) {
   }
 }
 
+// A drive that is plugged in but never enumerates is not the same as an empty
+// port: say so instead of pulsing the idle colour and going dark.
+static void presence_service(void) {
+  if (!device_at_boot || wipe_state != WIPE_IDLE || status != STATUS_IDLE) {
+    return;
+  }
+  if (ms_since(state_since_us) < NO_ENUM_MS) {
+    return;
+  }
+
+  printf("Note: a drive is attached but never enumerated - unsupported drive?\n");
+  wipe_set_status(STATUS_UNRECOGNISED);
+  // Restart the dwell so the blink is visible before the board powers down.
+  wipe_set_state(WIPE_IDLE);
+}
+
 // Called from the main loop. Returns only while a console is open; otherwise
 // the board powers down for good.
 static void power_service(void) {
@@ -940,7 +990,11 @@ static void console_wait(uint32_t timeout_ms) {
   }
 }
 
-static bool usb_host_init(void) {
+// Powers the USB-A port and starts the host. *device_attached reports whether a
+// drive was already showing its pull-up when the port came up, which is the only
+// moment we can tell "nothing plugged in" from "plugged in but never enumerated"
+// (once PIO-USB owns the pins it drives them, so the pad reads are its own).
+static bool usb_host_init(bool *device_attached) {
   // Power the USB-A connector (5 V boost enable) and let the rail settle
   // before the PIO-USB controller starts driving the bus.
   gpio_init(BOARD_USB_5V_EN_PIN);
@@ -952,6 +1006,28 @@ static bool usb_host_init(void) {
   gpio_set_dir(BOARD_USB_HOST_DM_PIN, GPIO_OUT);
   gpio_put(BOARD_USB_HOST_DM_PIN, 0);
   sleep_ms(250);
+
+  // Bus sense, before PIO-USB takes the pins: plain inputs with the internal
+  // pull-downs, so a high line can only come from the drive.
+  gpio_init(BOARD_USB_HOST_DP_PIN);
+  gpio_set_dir(BOARD_USB_HOST_DP_PIN, GPIO_IN);
+  gpio_set_input_enabled(BOARD_USB_HOST_DP_PIN, true);
+  gpio_pull_down(BOARD_USB_HOST_DP_PIN);
+  gpio_init(BOARD_USB_HOST_DM_PIN);
+  gpio_set_dir(BOARD_USB_HOST_DM_PIN, GPIO_IN);
+  gpio_set_input_enabled(BOARD_USB_HOST_DM_PIN, true);
+  gpio_pull_down(BOARD_USB_HOST_DM_PIN);
+
+  *device_attached = false;
+  for (uint32_t waited = 0; waited < BUS_SENSE_MS; waited += 10) {
+    sense_dp_high = gpio_get(BOARD_USB_HOST_DP_PIN) != 0;
+    sense_dm_high = gpio_get(BOARD_USB_HOST_DM_PIN) != 0;
+    if (sense_dp_high || sense_dm_high) {
+      *device_attached = true;
+      break;
+    }
+    sleep_ms(10);
+  }
 
   pio_usb_configuration_t pio_cfg = PIO_USB_DEFAULT_CONFIG;
   pio_cfg.pin_dp = BOARD_USB_HOST_DP_PIN;
@@ -1039,6 +1115,20 @@ static void console_service(void) {
     return;
   }
 
+  if (c == 's' || c == 'S') {
+    // Raw bus state: if D+ is high the drive is powered and pulling up, so a
+    // missing mount means enumeration failed; a low D+ means nothing is there
+    // (no power, bad contact, or no device).
+    printf("Host %s | D+=%u D-=%u | MSC %s addr %u | state %d | boot sense D+=%u D-=%u\n",
+           tuh_inited() ? "up" : "down",
+           (unsigned)gpio_get(BOARD_USB_HOST_DP_PIN),
+           (unsigned)gpio_get(BOARD_USB_HOST_DM_PIN),
+           (msc_dev_addr != 0 && tuh_msc_mounted(msc_dev_addr)) ? "mounted" : "none",
+           (unsigned)msc_dev_addr, (int)wipe_state,
+           (unsigned)sense_dp_high, (unsigned)sense_dm_high);
+    return;
+  }
+
   if (c == 'p' || c == 'P') {
     // Power-cycling VBUS forces a re-enumerate: handy to recover a wedged
     // stick, and it exercises the unmount path.
@@ -1097,9 +1187,9 @@ int main(void) {
   printf("Powers down after %lu ms without a drive, or %lu ms after a result.\n",
          (unsigned long)IDLE_SLEEP_MS, (unsigned long)RESULT_HOLD_MS);
   printf("Press RESET (with a drive in the port) to clean one.\n");
-  printf("(ENTER = re-run sanitize, t = read test, p = power-cycle port, b = BOOTSEL)\n");
+  printf("(ENTER = re-run, t = read test, s = bus state, p = power-cycle port, b = BOOTSEL)\n");
 
-  if (!usb_host_init()) {
+  if (!usb_host_init(&device_at_boot)) {
     printf("FATAL: TinyUSB host init failed\n");
     wipe_set_state(WIPE_ERROR);
     wipe_set_status(STATUS_ERROR);
@@ -1108,6 +1198,13 @@ int main(void) {
     // drive that is already plugged in is enumerated before we sleep.
     wipe_set_state(WIPE_IDLE);
   }
+  if (device_at_boot) {
+    printf("Drive on the port at boot: D+=%u D-=%u (pull-up on %s)\n",
+           (unsigned)sense_dp_high, (unsigned)sense_dm_high,
+           sense_dp_high && sense_dm_high ? "both lines!"
+           : sense_dp_high               ? "D+, full-speed"
+                                         : "D-, low-speed");
+  }
 
   while (true) {
     tud_task();  // native USB device (CDC console)
@@ -1115,6 +1212,7 @@ int main(void) {
     wipe_service();
     console_service();
     status_led_task();
-    power_service();  // switches the board off unless something is going on
+    presence_service(); // "attached but never enumerated" is worth a colour
+    power_service();    // switches the board off unless something is going on
   }
 }
