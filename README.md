@@ -13,6 +13,13 @@ Windows/Linux/macOS — no PC-side format step.
 > data clusters outside the metadata region are not overwritten, but nothing
 > references them any more.
 
+It is built for battery operation: when there is nothing to do it switches the
+USB-A rail and the LED off, drops into RP2040 **DORMANT** mode and stays dark
+until the reset button is pressed — insert a drive, press RST, and it sanitizes
+it and goes dark again. See *Power down* below. Only drives of at most
+**32 GiB** are accepted, i.e. the range where FAT32 is the file system a drive
+is expected to carry; bigger drives are refused, untouched.
+
 ---
 
 ## What the stick looks like afterwards
@@ -36,11 +43,11 @@ quickly**:
 |---|---|---|---|
 | < 2 GiB | 4 KiB | varies | ~0.3–2 MiB |
 | 2–8 GiB | 32 KiB | ~0.3–0.6 MiB | ~0.4–0.7 MiB |
-| ≥ 8 GiB | **64 KiB** | ~1 MiB | ~1.04 MiB |
+| 8–32 GiB | **64 KiB** | ~1–2 MiB | ~1–2 MiB |
 
 FAT32 stores 4 bytes *per cluster*, and every free cluster must be zero, so the
-FAT is the dominant write cost. 64 KiB clusters keep a 16–32 GiB stick at about
-1 MiB of metadata. Windows, Linux and macOS all mount 64 KiB-cluster FAT32;
+FAT is the dominant write cost. 64 KiB clusters keep a 16–32 GiB stick at 1–2
+MiB of metadata. Windows, Linux and macOS all mount 64 KiB-cluster FAT32;
 old car stereos may not.
 
 ---
@@ -76,6 +83,9 @@ The write rate is the stick's, not the firmware's: the same build reads at
 
 ## Sequence on mount
 
+The capacity is checked before anything is written: a drive above 32 GiB is
+**refused and left untouched**.
+
 1. `tuh_msc_mount_cb()` records capacity and block size and raises a flag. It
    must not block — it runs inside `tuh_task()`, and anything that waits there
    (or prints through USB CDC, which pumps `tud_task()`) deadlocks the host
@@ -91,6 +101,48 @@ The write rate is the stick's, not the firmware's: the same build reads at
 
 No file system is mounted and no FAT library is linked; the layout is emitted
 directly as bytes.
+
+---
+
+## Power down, wake on RESET
+
+When there is nothing to do, the board switches off everything it can and stays
+dark until the **reset button** is pressed:
+
+* **USB-A 5 V rail off** (GP18 low) — the drive is unpowered, the board's green
+  5 V LED goes out, the TPS61023 stops drawing quiescent current.
+* **NeoPixel rail off** — no status LED.
+* **RP2040 DORMANT** — crystal off, PLLs de-initialised, `clk_usb`/`clk_adc`
+  stopped, ring oscillator off. That is the lowest state an RP2040 has: ~1–2 mA,
+  i.e. weeks on a 2000 mAh LiPo. It cannot switch itself off any further.
+
+It powers down when
+
+* nothing is mounted and nothing is pending for `IDLE_SLEEP_MS` (5 s) — this is
+  what happens at power-on with an empty port, or after a drive is pulled out,
+  or
+* a run has finished and its colour has been on the LED for `RESULT_HOLD_MS`
+  (2.5 s): green for done, magenta for refused, red for error.
+
+Waking is a **reset**, so nothing has to be detected and nothing has to be
+resumed: RST resets the chip, the bootrom starts the firmware, it enumerates
+whatever is in the USB-A port, sanitizes it, and switches off again. The same
+firmware path handles a cold boot, a reset and a power cycle, and there is no
+state that can go stale while the board sits in a drawer. `power_off()` is
+`xosc_dormant()` plus the rails off — about twenty lines, no wake-up source, no
+reboot trick.
+
+The consequence of sleeping all the way: **plugging a drive in does not wake
+the board**. Plug the drive in, press RST, watch the LED.
+
+The clock surgery is adapted from `pico-extras`' `pico_sleep` (XOSC only, no
+PLLs), kept in `main.c` so the project does not need a second SDK checkout.
+
+One thing is deliberately *not* a power-down: while a console is open
+(`stdio_usb_connected()`, i.e. DTR up on the USB-C CDC port) the board stays
+awake so a workbench session keeps its log — the CDC link does not survive
+DORMANT anyway. Close the monitor and it powers down; on battery there is no
+console, so it always does.
 
 ---
 
@@ -118,7 +170,9 @@ restores upstream behaviour.
 | Yellow pulsing | Idle, waiting for a drive |
 | Blue blinking | Writing the new file system |
 | Green solid | Done: cache flushed, structures verified |
+| Magenta blinking | Refused: drive is larger than 32 GiB (nothing was written) |
 | Red solid | Error: block size, write failure, verification failure, timeout |
+| Off | Powered down: dormant, NeoPixel and USB-A rails off (press RESET) |
 
 NeoPixel data **GP21**, power gate **GP20**; the onboard red LED on **GP13**
 follows along.
@@ -136,7 +190,8 @@ follows along.
 | NeoPixel power gate | 20 |
 | Onboard LED | 13 |
 
-GP18 is driven high at boot to power the USB-A connector.
+GP18 is driven high at boot to power the USB-A connector, and driven low when
+the board powers down, so a drive left in the port is not powered either.
 
 ---
 
@@ -176,7 +231,10 @@ Console on the native USB-C CDC port (115200 8N1, baud is ignored):
  Feather USB Cleaner (sanitize + FAT32 rebuild)
 =====================================
 Output: fresh empty FAT32 labelled 'CLEANED', 1 FAT, big clusters
+Limits: drives up to 32768 MiB (FAT32 range)
 Ready - insert a USB flash drive...
+Powers down after 5000 ms without a drive, or 2500 ms after a result.
+Press RESET (with a drive in the port) to clean one.
 (ENTER = re-run sanitize, t = read test, p = power-cycle port, b = BOOTSEL)
 
 MSC device mounted at address 1: 30720000 blocks x 512 B (15000 MiB)
@@ -192,6 +250,18 @@ Verified: MBR / partition table
 Verified: FAT32 boot sector
 Verified: FAT
 Sanitized in ... ms (... KiB/s). Stick is empty and mountable.
+```
+
+On battery there is no console, so after `RESULT_HOLD_MS` the LED simply goes
+dark and the board powers down. `bench` note: with a serial monitor open the
+board stays awake (see *Power down*), so to watch it go dark either close the
+monitor or run it from the battery.
+
+With a 64 GiB drive in the port instead:
+
+```
+MSC device mounted at address 1: 125045424 blocks x 512 B (61049 MiB)
+REFUSED: 61049 MiB drive, this cleaner handles up to 32768 MiB (FAT32)
 ```
 
 | Key | Action |
@@ -215,7 +285,9 @@ fsck.fat -n -v /tmp/stick_part.img
 ```
 
 Known-good results: 4 GiB, 8 GiB, 30 GB and 64 GB geometries are `fsck.fat`
-clean (1 file = the volume label, 1 cluster in use = root directory).
+clean (1 file = the volume label, 1 cluster in use = root directory). The
+builder itself has no upper size limit — the 32 GiB refusal is a policy in
+`main.c`.
 
 ---
 
@@ -226,11 +298,15 @@ At the top of `main.c`:
 | Macro | Default | Meaning |
 |---|---|---|
 | `FS_LABEL` | `"CLEANED"` | Volume label of the new file system |
+| `MAX_DEVICE_BYTES` | 32 GiB | Biggest drive accepted; bigger ones are refused |
+| `IDLE_SLEEP_MS` | 5000 | Awake time with nothing mounted before powering down |
+| `RESULT_HOLD_MS` | 2500 | How long the result colour stays on before powering down |
+| `CONSOLE_WAIT_MS` | 1500 | Boot-time wait for the USB-C console to attach |
 | `CHUNK_BYTES` | 32 KiB | Bytes per `WRITE(10)`; must stay ≤ 65535 |
 | `MAX_CHUNK_RETRIES` | 3 | Retries per chunk before giving up |
 | `XFER_TIMEOUT_MS` | 1500 | Stalled bulk transfer watchdog |
 | `FLUSH_TIMEOUT_MS` | 30000 | `SYNCHRONIZE CACHE` watchdog |
-| `WIPE_TIMEOUT_MS` | 15000 | Whole-operation watchdog |
+| `WIPE_TIMEOUT_MS` | 30000 | Whole-operation watchdog (a 32 GiB stick needs ~2 MiB of metadata) |
 
 Cluster size is picked in `fat32_builder.c` (`fat32_plan`) from the device size.
 
@@ -244,8 +320,16 @@ Cluster size is picked in `fat32_builder.c` (`fat32_plan`) from the device size.
   cluster sizes); smaller devices are refused.
 * Old file *data* is still on the flash. The new FAT32 makes it unreachable,
   but forensic recovery is possible — this is not a DoD/NIST purge.
+* Only drives up to 32 GiB are sanitized. Larger ones are refused and left
+  alone (magenta LED).
 * One drive at a time; a second MSC device behind a hub is ignored while a
   sanitize run is in progress.
+* Powering down is total: the USB-A rail is off, so **inserting a drive does
+  not wake the board** — press RESET after inserting one.
+* DORMANT still draws ~1–2 mA (SRAM retention); the RP2040 cannot switch itself
+  off from software, so a long shelf life needs the battery unplugged.
+* Waking up is a reset: on a PC the CDC console disappears and re-enumerates,
+  and the boot banner is printed again.
 
 ---
 
@@ -253,7 +337,7 @@ Cluster size is picked in `fat32_builder.c` (`fat32_plan`) from the device size.
 
 ```
 CMakeLists.txt                 pico_stdlib + tinyusb_host + PIO-USB
-main.c                         USB host, sanitize state machine, NeoPixel
+main.c                         USB host, sanitize state machine, power down, NeoPixel
 fat32_builder.c / .h           dependency-free FAT32 layout generator
 tusb_config.h                  dual role: CDC device (console) + MSC host
 ws2812.pio                     NeoPixel PIO program

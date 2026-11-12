@@ -101,6 +101,11 @@ target_link_libraries(feather_usb_cleaner PRIVATE
         tinyusb_board
         ${PIO_USB_TARGET}
         hardware_pio
+        # Power-down: clock/PLL/crystal surgery, ring oscillator
+        hardware_clocks
+        hardware_pll
+        hardware_xosc
+        hardware_rosc
 )
 
 # Console on the native USB-C port (CDC-ACM), no UART pins needed.

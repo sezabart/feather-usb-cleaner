@@ -4,7 +4,14 @@
  * Sanitizes a USB flash drive so it comes back EMPTY but fully usable, on the
  * Adafruit Feather RP2040 with USB Type A Host.
  *
+ * Battery operation (see "Power off" below): when there is nothing to do the
+ * board turns the USB-A rail and the NeoPixel rail off and drops into RP2040
+ * DORMANT mode. It stays dark until the reset button is pressed; RST boots it,
+ * it sanitizes whatever is in the port, and it goes dark again.
+ *
  * Strategy (destructive by design, but a metadata rewrite, not a full erase):
+ *   - Only drives up to 32 GiB are accepted: that is the range where FAT32 is
+ *     the expected file system. Larger drives are refused untouched.
  *   - Enumerate the mass storage device through TinyUSB host (tuh_msc).
  *   - Emit a fresh, valid FAT32 file system directly with SCSI WRITE(10):
  *     MBR, boot sector, FSInfo, backup boot sectors, one FAT and an empty
@@ -18,10 +25,12 @@
  *   seconds instead of a full-drive erase.
  *
  * Status LED (NeoPixel on GP21, power gate GP20; mirrored on GP13):
- *   yellow pulsing -> idle / waiting for a device
- *   blue blinking  -> writing the new file system
- *   green solid    -> done, flushed and verified
- *   red solid      -> error (enumeration, unsupported block size, write error)
+ *   yellow pulsing   -> idle / waiting for a device
+ *   blue blinking    -> writing the new file system
+ *   green solid      -> done, flushed and verified
+ *   magenta blinking -> drive refused (larger than 32 GiB)
+ *   red solid        -> error (enumeration, unsupported block size, write error)
+ *   off              -> powered down (until RESET)
  *
  * SPDX-License-Identifier: MIT
  */
@@ -36,6 +45,10 @@
 #include "pico/bootrom.h"
 #include "hardware/gpio.h"
 #include "hardware/pio.h"
+#include "hardware/pll.h"
+#include "hardware/rosc.h"
+#include "hardware/sync.h"
+#include "hardware/xosc.h"
 #include "pico/stdlib.h"
 #include "pico/stdio_usb.h"
 #include "pico/time.h"
@@ -103,13 +116,33 @@
 // whole range, so these transfers legitimately take seconds on slow media.
 #define FLUSH_TIMEOUT_MS 30000u
 
-// Hard upper bound for the whole operation (spec: < 5 s).
-#define WIPE_TIMEOUT_MS 15000u
+// Hard upper bound for the whole operation. A 32 GiB stick needs ~2 MiB of
+// metadata, which is ~9 s at the ~244 KiB/s this stick writes, so the old 15 s
+// was uncomfortably close.
+#define WIPE_TIMEOUT_MS 30000u
 
 #define MAX_BLOCK_SIZE 4096u
 
 // Number of LBAs read back after the wipe (start / middle / end).
 #define VERIFY_POINTS 3
+
+// Largest drive we agree to sanitize: 32 GiB is where FAT32 stops being the
+// file system a drive is expected to carry (Microsoft's formatter refuses to
+// create FAT32 above it). Bigger drives are refused untouched instead of being
+// given a file system nobody expects.
+#define MAX_DEVICE_BYTES (32ull * 1024ull * 1024ull * 1024ull)
+
+// How long the result colour stays on before the board powers down.
+#define RESULT_HOLD_MS 2500u
+
+// How long the board stays awake with nothing mounted before it powers down.
+// Covers the enumeration of a drive that is already plugged in at boot.
+#define IDLE_SLEEP_MS 5000u
+
+// How long to wait for the USB-C console to attach at boot, so the banner is
+// not printed into the void on a workbench. Costs the same on every battery
+// wake, so keep it small.
+#define CONSOLE_WAIT_MS 1500u
 
 //--------------------------------------------------------------------
 // Status LED
@@ -119,6 +152,7 @@ typedef enum {
   STATUS_IDLE = 0, // yellow pulsing
   STATUS_WIPING,   // blue blinking
   STATUS_DONE,     // green solid
+  STATUS_REFUSED,  // magenta blinking
   STATUS_ERROR,    // red solid
 } status_t;
 
@@ -214,6 +248,15 @@ static void status_led_task(void) {
       led_on = true;
       break;
 
+    case STATUS_REFUSED: {
+      // Slow magenta blink: "nothing was done, and that was on purpose".
+      const bool on = ((now_ms / 250u) & 1u) != 0;
+      r = on ? 200 : 0;
+      b = on ? 255 : 0;
+      led_on = on;
+      break;
+    }
+
     case STATUS_ERROR:
       r = 255;
       led_on = true;
@@ -224,6 +267,14 @@ static void status_led_task(void) {
   const uint8_t max_brightness = 128;
   neopixel_put(scale8(r, max_brightness), scale8(g, max_brightness), scale8(b, max_brightness));
   gpio_put(BOARD_LED_PIN, led_on);
+}
+
+// Goes dark and cuts the NeoPixel rail; power_off() also drops the USB-A rail.
+static void status_led_shutdown(void) {
+  neopixel_put(0, 0, 0);
+  sleep_ms(1); // > the 50 us WS2812 latch time, so the frame is accepted
+  gpio_put(BOARD_NEOPIXEL_POWER_PIN, 0);
+  gpio_put(BOARD_LED_PIN, 0);
 }
 
 //--------------------------------------------------------------------
@@ -245,11 +296,16 @@ typedef enum {
   WIPE_SYNC,
   WIPE_VERIFY,
   WIPE_DONE,
+  WIPE_REFUSED,
   WIPE_ERROR,
 } wipe_state_t;
 
 static volatile wipe_state_t wipe_state = WIPE_IDLE;
 static volatile xfer_state_t xfer_state = XFER_IDLE;
+
+// When the current state was entered. Drives the "show the result, then go back
+// to sleep" timing.
+static volatile uint32_t state_since_us = 0;
 
 // Written by the TinyUSB host callbacks, consumed by the main loop.
 static volatile uint8_t pending_mount_addr = 0;
@@ -283,6 +339,11 @@ static uint8_t __attribute__((aligned(4))) verify_buf[MAX_BLOCK_SIZE];
 
 static inline uint32_t ms_since(uint32_t start_us) {
   return (uint32_t)((time_us_32() - start_us) / 1000u);
+}
+
+static void wipe_set_state(wipe_state_t new_state) {
+  wipe_state = new_state;
+  state_since_us = time_us_32();
 }
 
 static inline uint16_t get16(const uint8_t *p) {
@@ -340,9 +401,32 @@ static void wipe_fail(const char *fmt, ...) {
   va_end(args);
 
   printf("WIPE FAILED: %s\n", msg);
-  wipe_state = WIPE_ERROR;
+  wipe_set_state(WIPE_ERROR);
   xfer_state = XFER_IDLE;
   wipe_set_status(STATUS_ERROR);
+}
+
+// A deliberate "not this drive": nothing was written, so this is not a
+// failure, just a drive we do not support.
+static void wipe_refuse(const char *fmt, ...) {
+  char msg[96];
+  va_list args;
+  va_start(args, fmt);
+  vsnprintf(msg, sizeof(msg), fmt, args);
+  va_end(args);
+
+  printf("REFUSED: %s\n", msg);
+  wipe_set_state(WIPE_REFUSED);
+  xfer_state = XFER_IDLE;
+  wipe_set_status(STATUS_REFUSED);
+}
+
+// Back to "nothing to do": used when the drive goes away and by the state
+// machine's default branch. power_service() takes it from here.
+static void wipe_reset_to_idle(void) {
+  wipe_set_state(WIPE_IDLE);
+  xfer_state = XFER_IDLE;
+  wipe_set_status(STATUS_IDLE);
 }
 
 static bool msc_xfer_cb(uint8_t dev_addr, tuh_msc_complete_data_t const *cb_data);
@@ -401,7 +485,7 @@ void tuh_msc_mount_cb(uint8_t dev_addr) {
   msc_block_size = tuh_msc_get_block_size(dev_addr, 0);
   msc_block_count = tuh_msc_get_block_count(dev_addr, 0);
 
-  wipe_state = WIPE_PREPARE;
+  wipe_set_state(WIPE_PREPARE);
   wipe_set_status(STATUS_WIPING);
 }
 
@@ -409,10 +493,8 @@ void tuh_msc_umount_cb(uint8_t dev_addr) {
   pending_umount_addr = dev_addr;
 
   if (dev_addr == msc_dev_addr) {
-    wipe_state = WIPE_IDLE;
-    xfer_state = XFER_IDLE;
     msc_dev_addr = 0;
-    wipe_set_status(STATUS_IDLE);
+    wipe_reset_to_idle();
   }
 }
 
@@ -432,6 +514,16 @@ void tuh_umount_cb(uint8_t dev_addr) {
 static void wipe_prepare(void) {
   if (msc_dev_addr == 0 || msc_block_size == 0 || msc_block_count == 0) {
     wipe_fail("device reported no usable LUN 0 capacity");
+    return;
+  }
+
+  // FAT32 territory only. A 64 GiB stick is exFAT for a reason: the file
+  // system we write would not be what any OS or device expects there.
+  const uint64_t capacity_bytes = (uint64_t)msc_block_count * (uint64_t)msc_block_size;
+  if (capacity_bytes > MAX_DEVICE_BYTES) {
+    wipe_refuse("%lu MiB drive, this cleaner handles up to %lu MiB (FAT32)",
+                (unsigned long)(capacity_bytes >> 20),
+                (unsigned long)(MAX_DEVICE_BYTES >> 20));
     return;
   }
 
@@ -483,7 +575,7 @@ static void wipe_prepare(void) {
   verify_lbas[1] = fs_layout.part_start_lba;         // boot sector
   verify_lbas[2] = fs_layout.part_start_lba + fs_layout.reserved_sectors; // FAT
 
-  wipe_state = WIPE_WRITE;
+  wipe_set_state(WIPE_WRITE);
 }
 
 static void wipe_print_progress(void) {
@@ -499,7 +591,7 @@ static void wipe_print_progress(void) {
 static void wipe_finish(void) {
   const uint32_t elapsed_ms = ms_since(wipe_started_us);
 
-  wipe_state = WIPE_DONE;
+  wipe_set_state(WIPE_DONE);
   wipe_set_status(STATUS_DONE);
 
   printf("Sanitized in %lu ms (%.1f KiB/s). Stick is empty and mountable.\n",
@@ -551,7 +643,7 @@ static void wipe_service(void) {
 
       if (xfer_state == XFER_IDLE) {
         if (fs_cursor >= fs_region_sectors) {
-          wipe_state = WIPE_MBR; // FS is in place; commit the MBR last
+          wipe_set_state(WIPE_MBR); // FS is in place; commit the MBR last
           return;
         }
 
@@ -620,7 +712,7 @@ static void wipe_service(void) {
         bytes_written += msc_block_size;
         retry_count = 0;
         printf("Partition table written (commit)\n");
-        wipe_state = WIPE_SYNC;
+        wipe_set_state(WIPE_SYNC);
       } else if (xfer_state == XFER_FAIL) {
         xfer_state = XFER_IDLE;
         if (++retry_count > MAX_CHUNK_RETRIES) {
@@ -649,7 +741,7 @@ static void wipe_service(void) {
       } else if (xfer_state == XFER_OK) {
         xfer_state = XFER_IDLE;
         printf("Cache flushed (SYNCHRONIZE CACHE 10)\n");
-        wipe_state = WIPE_VERIFY;
+        wipe_set_state(WIPE_VERIFY);
       } else if (xfer_state == XFER_FAIL) {
         // Some cheap sticks do not implement SYNCHRONIZE CACHE. The writes
         // themselves already completed, so treat this as a warning only.
@@ -657,7 +749,7 @@ static void wipe_service(void) {
         sync_unsupported = true;
         printf("Warning: SYNCHRONIZE CACHE (10) rejected (CSW status %u)\n",
                (unsigned)last_csw_status);
-        wipe_state = WIPE_VERIFY;
+        wipe_set_state(WIPE_VERIFY);
       } else if (ms_since(xfer_started_us) > FLUSH_TIMEOUT_MS) {
         wipe_fail("SYNCHRONIZE CACHE timed out");
       }
@@ -707,10 +799,116 @@ static void wipe_service(void) {
       return;
     }
 
+    case WIPE_REFUSED:
+      // Nothing to do: the result colour is on the LED and the sleep service
+      // below takes over once it has been shown for long enough.
+      return;
+
     default:
-      wipe_state = WIPE_IDLE;
+      wipe_reset_to_idle();
       return;
   }
+}
+
+//--------------------------------------------------------------------
+// Power off: dark and quiet until the reset button
+//--------------------------------------------------------------------
+//
+// There is nothing to detect while asleep, so nothing is left running: the
+// USB-A rail and the NeoPixel rail are switched off and the RP2040 drops into
+// DORMANT mode (crystal and PLLs off, all clocks stopped, SRAM retained).
+//
+// Waking up is the reset button. RST resets the chip, the firmware boots from
+// the bootrom exactly like it does at power-on, sees whatever is in the USB-A
+// port, sanitizes it, and switches off again. No wake-up source to configure,
+// no host stack to resume, and nothing that can go stale while the board sits
+// in a drawer: every run starts from a cold boot.
+
+// Adapted from pico-extras' pico_sleep (BSD-3-Clause, (c) 2020 Raspberry Pi
+// (Trading) Ltd.): a dormant RP2040 must be clocked from the crystal with no
+// PLLs running, so everything else is stopped first. Kept local instead of
+// pulling in the whole pico-extras dependency for one function.
+static void clocks_prepare_for_dormant(void) {
+  const uint32_t xosc_hz = XOSC_HZ;
+
+  // CLK_REF = XOSC, CLK_SYS = CLK_REF
+  clock_configure(clk_ref, CLOCKS_CLK_REF_CTRL_SRC_VALUE_XOSC_CLKSRC, 0, xosc_hz,
+                  xosc_hz);
+  clock_configure(clk_sys, CLOCKS_CLK_SYS_CTRL_SRC_VALUE_CLK_REF, 0, xosc_hz,
+                  xosc_hz);
+
+  // USB and ADC have to go: they cannot be stopped once the chip is dormant.
+  clock_stop(clk_usb);
+  clock_stop(clk_adc);
+
+  // RTC = XOSC / 256.
+  clock_configure(clk_rtc, 0, CLOCKS_CLK_RTC_CTRL_AUXSRC_VALUE_XOSC_CLKSRC, xosc_hz,
+                  46875);
+  clock_configure(clk_peri, 0, CLOCKS_CLK_PERI_CTRL_AUXSRC_VALUE_CLK_SYS, xosc_hz,
+                  xosc_hz);
+
+  pll_deinit(pll_sys);
+  pll_deinit(pll_usb);
+  rosc_disable();
+}
+
+// Switches off everything that can be switched off and stays there until the
+// reset button is pressed. Nothing is printed on the way out: an open console
+// is the one reason not to come here at all.
+static void power_off(void) {
+  // LEDs first, while there is still a fast clock for the NeoPixel protocol.
+  status_led_shutdown();
+
+  // The USB-A rail goes too: the drive is left unpowered, the board's 5 V LED
+  // goes out, and the boost converter stops drawing its quiescent current.
+  gpio_put(BOARD_USB_5V_EN_PIN, 0);
+
+  // Sign off the USB-C port as well. The PHY keeps its pull-up while the clocks
+  // are stopped, so without this the host would keep a dead CDC port in its
+  // device list instead of seeing the board go away.
+  tud_disconnect();
+
+  // Interrupts off before the clocks go: the PIO-USB frame alarm must not try
+  // to drive the bus while clk_sys is being taken down.
+  const uint32_t ints = save_and_disable_interrupts();
+  (void)ints;
+  clocks_prepare_for_dormant();
+
+  // DORMANT is the RP2040's lowest-power state: crystal and PLLs off, all
+  // clocks stopped, SRAM retained. Nothing but a reset gets the CPU going
+  // again, which is exactly the wake-up we want.
+  xosc_dormant();
+
+  // Only reached if the crystal never stopped; the board is then still dark and
+  // idle at 12 MHz, and RST still wakes it.
+  for (;;) {
+    tight_loop_contents();
+  }
+}
+
+// Called from the main loop. Returns only while a console is open; otherwise
+// the board powers down for good.
+static void power_service(void) {
+  const bool idle = (wipe_state == WIPE_IDLE) && (msc_dev_addr == 0) &&
+                    (pending_mount_addr == 0);
+  const bool result = (wipe_state == WIPE_DONE) || (wipe_state == WIPE_ERROR) ||
+                      (wipe_state == WIPE_REFUSED);
+  if (!idle && !result) {
+    return;
+  }
+
+  const uint32_t hold_ms = idle ? IDLE_SLEEP_MS : RESULT_HOLD_MS;
+  if (ms_since(state_since_us) < hold_ms) {
+    return;
+  }
+
+  // An open console (DTR up) means somebody is watching: stay awake so the log
+  // is not cut short. On battery nobody is listening, so the board goes dark.
+  if (stdio_usb_connected()) {
+    return;
+  }
+
+  power_off();
 }
 
 //--------------------------------------------------------------------
@@ -859,9 +1057,10 @@ static void console_service(void) {
     return;
   }
   if (msc_dev_addr != 0 && tuh_msc_mounted(msc_dev_addr) &&
-      (wipe_state == WIPE_IDLE || wipe_state == WIPE_DONE || wipe_state == WIPE_ERROR)) {
+      (wipe_state == WIPE_IDLE || wipe_state == WIPE_DONE ||
+       wipe_state == WIPE_REFUSED || wipe_state == WIPE_ERROR)) {
     printf("Re-running wipe on device address %u\n", (unsigned)msc_dev_addr);
-    wipe_state = WIPE_PREPARE;
+    wipe_set_state(WIPE_PREPARE);
   }
 }
 
@@ -874,7 +1073,7 @@ int main(void) {
   stdio_init_all();
 
   status_led_init();
-  console_wait(1500);
+  console_wait(CONSOLE_WAIT_MS);
 
   printf("\n");
   printf("=====================================\n");
@@ -886,12 +1085,22 @@ int main(void) {
          (unsigned)BOARD_USB_5V_EN_PIN);
   printf("Output: fresh empty FAT32 labelled '%s', 1 FAT, big clusters\n",
          FS_LABEL);
+  printf("Limits: drives up to %lu MiB (FAT32 range)\n",
+         (unsigned long)(MAX_DEVICE_BYTES >> 20));
   printf("Ready - insert a USB flash drive...\n");
+  printf("Powers down after %lu ms without a drive, or %lu ms after a result.\n",
+         (unsigned long)IDLE_SLEEP_MS, (unsigned long)RESULT_HOLD_MS);
+  printf("Press RESET (with a drive in the port) to clean one.\n");
   printf("(ENTER = re-run sanitize, t = read test, p = power-cycle port, b = BOOTSEL)\n");
 
   if (!usb_host_init()) {
     printf("FATAL: TinyUSB host init failed\n");
+    wipe_set_state(WIPE_ERROR);
     wipe_set_status(STATUS_ERROR);
+  } else {
+    // Start the "nothing is happening" clock now that the host is up, so a
+    // drive that is already plugged in is enumerated before we sleep.
+    wipe_set_state(WIPE_IDLE);
   }
 
   while (true) {
@@ -900,5 +1109,6 @@ int main(void) {
     wipe_service();
     console_service();
     status_led_task();
+    power_service();  // switches the board off unless something is going on
   }
 }
