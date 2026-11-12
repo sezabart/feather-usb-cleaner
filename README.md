@@ -276,6 +276,27 @@ reboot into the bootloader.
 
 ---
 
+## Case
+
+A printable two-part case (body + cover) and a label with the LED legend. The
+label's colours match the firmware's status table, so the sticker doubles as the
+quick reference for what the NeoPixel is saying.
+
+<img src="case/IMG_20261112_174621.jpg" width="300" alt="Printed case with the USB-C power cable connected">
+<img src="case/FeatherUSBCleaner.png" width="420" alt="Case label: Waiting yellow, Working blue, Long work magenta, Problem red, Success green, reset">
+
+| File | What it is |
+|---|---|
+| `case/Case.stl` | body — 56.0 × 47.6 × 12.0 mm (3 568 triangles) |
+| `case/Cover.stl` | cover — 56.0 × 32.0 × 6.6 mm, sits on top of the body (1 648 triangles) |
+| `case/FeatherUSBCleaner.png` | label with the LED legend: *Waiting* yellow, *Working* blue, *Long work* magenta, *Problem* red, *Success* green, plus *reset* |
+| `case/IMG_20261112_174621.jpg` | photo of the printed case |
+
+Print settings are whatever the author used; the STLs are plain binary STL in
+millimetres, nothing exotic.
+
+---
+
 ## Using it
 
 Console on the native USB-C CDC port (115200 8N1, baud is ignored):
@@ -427,6 +448,7 @@ fat32_builder.c / .h           dependency-free FAT32 layout generator
 tusb_config.h                  dual role: CDC device (console) + MSC host
 ws2812.pio                     NeoPixel PIO program
 tools/fat32_image.c            host-side image generator (fsck.fat validation)
+case/                          printable body + cover, label with the LED legend
 third_party/Pico-PIO-USB/      vendored, patched (bulk batching)
 ```
 
