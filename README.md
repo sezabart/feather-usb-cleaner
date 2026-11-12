@@ -295,6 +295,14 @@ quick reference for what the NeoPixel is saying.
 Print settings are whatever the author used; the STLs are plain binary STL in
 millimetres, nothing exotic.
 
+**Credit:** the case is a remix of *Case for Feather RP2040 USB Host* by
+[Adafruit](https://www.printables.com/model/462499-case-for-feather-rp2040-usb-host)
+(also on [Thingiverse](https://www.thingiverse.com/thing:6001739)), trimmed down
+for this project (body 56.0 × 47.6 × 12.0 mm versus the original's
+56 × 49.3 × 13.8 mm) and given the LED-legend label. The STL and label files
+here are that remix, so their terms follow the original model — check the model
+page before redistributing. The firmware source in this repository stays MIT.
+
 ---
 
 ## Using it
