@@ -16,9 +16,10 @@ Windows/Linux/macOS — no PC-side format step.
 It is built for battery operation: when there is nothing to do it switches the
 USB-A rail and the LED off, drops into RP2040 **DORMANT** mode and stays dark
 until the reset button is pressed — insert a drive, press RST, and it sanitizes
-it and goes dark again. See *Power down* below. Only drives of at most
-**32 GiB** are accepted, i.e. the range where FAT32 is the file system a drive
-is expected to carry; bigger drives are refused, untouched.
+it and goes dark again. See *Power down* below. Any drive size is accepted, and
+the result is always **FAT32** — which is what the target devices (Prusa MK4,
+MK3, MINI: FAT32 only, no exFAT) actually read. Above 32 GiB, where a drive no
+longer ships FAT32, the LED flashes magenta for a moment first.
 
 ---
 
@@ -44,10 +45,12 @@ quickly**:
 | < 2 GiB | 4 KiB | varies | ~0.3–2 MiB |
 | 2–8 GiB | 32 KiB | ~0.3–0.6 MiB | ~0.4–0.7 MiB |
 | 8–32 GiB | **64 KiB** | ~1–2 MiB | ~1–2 MiB |
+| 32–128 GiB | **64 KiB** | ~2–8 MiB | ~2–8 MiB |
+| 128 GiB–2 TiB | **64 KiB** | ~8–128 MiB | ~8–128 MiB |
 
 FAT32 stores 4 bytes *per cluster*, and every free cluster must be zero, so the
-FAT is the dominant write cost. 64 KiB clusters keep a 16–32 GiB stick at 1–2
-MiB of metadata. Windows, Linux and macOS all mount 64 KiB-cluster FAT32;
+FAT is the dominant write cost: 4 bytes per 64 KiB cluster, i.e. ~2 MiB per
+32 GiB of drive. Windows, Linux and macOS all mount 64 KiB-cluster FAT32;
 old car stereos may not.
 
 ---
@@ -59,7 +62,8 @@ Hardware: Feather RP2040 USB Host, 125 MHz, USB-A port in Full-Speed host mode,
 
 | Operation | Result |
 |---|---|
-| Sanitize + FAT32 rebuild (≈1.04 MiB written) | **~4.3 s** (~244 KiB/s) — same write volume as the old 1 MiB wipe |
+| Sanitize + FAT32 rebuild, 15 000 MiB stick (≈1.04 MiB written) | **~4.3 s** (~244 KiB/s) — same write volume as the old 1 MiB wipe |
+| Sanitize + FAT32 rebuild, 120 000 MiB stick (7.6 MiB written) | **31.1 s** (246 KiB/s), magenta heads-up first; `SYNCHRONIZE CACHE` rejected, warning only |
 | Raw read throughput of the same build | 653 KiB/s |
 | Upstream Pico-PIO-USB, before the patch below | 64 KiB/s ceiling → ~16 s for 1 MiB |
 
@@ -83,8 +87,9 @@ The write rate is the stick's, not the firmware's: the same build reads at
 
 ## Sequence on mount
 
-The capacity is checked before anything is written: a drive above 32 GiB is
-**refused and left untouched**.
+Above 32 GiB the LED shows magenta for `LARGE_NOTICE_MS` (2 s) before the
+writes start — a heads-up that this is one of the big ones, not a refusal. The
+wipe itself is identical, it just has more FAT to lay down.
 
 1. `tuh_msc_mount_cb()` records capacity and block size and raises a flag. It
    must not block — it runs inside `tuh_task()`, and anything that waits there
@@ -122,7 +127,7 @@ It powers down when
   what happens at power-on with an empty port, or after a drive is pulled out,
   or
 * a run has finished and its colour has been on the LED for `RESULT_HOLD_MS`
-  (2.5 s): green for done, magenta for refused, red for error.
+  (2.5 s): green for done, red for error.
 
 Waking is a **reset**, so nothing has to be detected and nothing has to be
 resumed: RST resets the chip, the bootrom starts the firmware, it enumerates
@@ -170,7 +175,7 @@ restores upstream behaviour.
 | Yellow pulsing | Idle, waiting for a drive |
 | Blue blinking | Writing the new file system |
 | Green solid | Done: cache flushed, structures verified |
-| Magenta blinking | Refused: drive is larger than 32 GiB (nothing was written) |
+| Magenta blinking | Heads-up: drive is larger than 32 GiB, writing starts next |
 | Red solid | Error: block size, write failure, verification failure, timeout |
 | Off | Powered down: dormant, NeoPixel and USB-A rails off (press RESET) |
 
@@ -231,7 +236,7 @@ Console on the native USB-C CDC port (115200 8N1, baud is ignored):
  Feather USB Cleaner (sanitize + FAT32 rebuild)
 =====================================
 Output: fresh empty FAT32 labelled 'CLEANED', 1 FAT, big clusters
-Limits: drives up to 32768 MiB (FAT32 range)
+Size: no limit; drives over 32768 MiB show magenta first, then blue
 Ready - insert a USB flash drive...
 Powers down after 5000 ms without a drive, or 2500 ms after a result.
 Press RESET (with a drive in the port) to clean one.
@@ -257,12 +262,28 @@ dark and the board powers down. `bench` note: with a serial monitor open the
 board stays awake (see *Power down*), so to watch it go dark either close the
 monitor or run it from the battery.
 
-With a 64 GiB drive in the port instead:
+With a 128 GB drive in the port instead (measured):
 
 ```
-MSC device mounted at address 1: 125045424 blocks x 512 B (61049 MiB)
-REFUSED: 61049 MiB drive, this cleaner handles up to 32768 MiB (FAT32)
+MSC device mounted at address 1: 245760000 blocks x 512 B (120000 MiB)
+Sanitize: rebuilding FAT32 'CLEANED' on 120000 MiB (large drive)
+  partition LBA 2048..245759999, 64 KiB clusters, 1 FAT of 7500 KiB
+  writing 7628 KiB of metadata (15256 sectors)
+    0%  64/15256 sectors  32 KiB  t=130 ms
+ ...
+  100%  15256/15256 sectors  7628 KiB  t=31037 ms
+Partition table written (commit)
+Warning: SYNCHRONIZE CACHE (10) rejected (CSW status 1)
+Verified: MBR / partition table
+Verified: FAT32 boot sector
+Verified: FAT
+Sanitized in 31059 ms (245.6 KiB/s). Stick is empty and mountable.
+Note: drive rejected SYNCHRONIZE CACHE (10); WRITE(10) already returned
 ```
+
+(The magenta blink happens on the LED in the two seconds before that log
+starts. A stick that rejects `SYNCHRONIZE CACHE` is only a warning: the
+`WRITE(10)` calls have already completed and the read-back checks still pass.)
 
 | Key | Action |
 |---|---|
@@ -285,9 +306,9 @@ fsck.fat -n -v /tmp/stick_part.img
 ```
 
 Known-good results: 4 GiB, 8 GiB, 30 GB and 64 GB geometries are `fsck.fat`
-clean (1 file = the volume label, 1 cluster in use = root directory). The
-builder itself has no upper size limit — the 32 GiB refusal is a policy in
-`main.c`.
+clean (1 file = the volume label, 1 cluster in use = root directory). There is
+no size policy in the firmware either — it builds whatever `fat32_plan` accepts
+up to the 2 TiB a FAT32 partition table can address.
 
 ---
 
@@ -298,7 +319,8 @@ At the top of `main.c`:
 | Macro | Default | Meaning |
 |---|---|---|
 | `FS_LABEL` | `"CLEANED"` | Volume label of the new file system |
-| `MAX_DEVICE_BYTES` | 32 GiB | Biggest drive accepted; bigger ones are refused |
+| `LARGE_DRIVE_BYTES` | 32 GiB | Above this the magenta heads-up is shown first |
+| `LARGE_NOTICE_MS` | 2000 | How long that heads-up lasts before writing |
 | `IDLE_SLEEP_MS` | 5000 | Awake time with nothing mounted before powering down |
 | `RESULT_HOLD_MS` | 2500 | How long the result colour stays on before powering down |
 | `CONSOLE_WAIT_MS` | 1500 | Boot-time wait for the USB-C console to attach |
@@ -306,7 +328,8 @@ At the top of `main.c`:
 | `MAX_CHUNK_RETRIES` | 3 | Retries per chunk before giving up |
 | `XFER_TIMEOUT_MS` | 1500 | Stalled bulk transfer watchdog |
 | `FLUSH_TIMEOUT_MS` | 30000 | `SYNCHRONIZE CACHE` watchdog |
-| `WIPE_TIMEOUT_MS` | 30000 | Whole-operation watchdog (a 32 GiB stick needs ~2 MiB of metadata) |
+| `WIPE_TIMEOUT_BASE_MS` | 15000 | Whole-operation watchdog base |
+| `WIPE_MIN_BYTES_PER_MS` | 100 | Bytes/ms assumed for the metadata, so the watchdog scales with drive size |
 
 Cluster size is picked in `fat32_builder.c` (`fat32_plan`) from the device size.
 
@@ -320,8 +343,11 @@ Cluster size is picked in `fat32_builder.c` (`fat32_plan`) from the device size.
   cluster sizes); smaller devices are refused.
 * Old file *data* is still on the flash. The new FAT32 makes it unreachable,
   but forensic recovery is possible — this is not a DoD/NIST purge.
-* Only drives up to 32 GiB are sanitized. Larger ones are refused and left
-  alone (magenta LED).
+* FAT32 only, on purpose: the target printers (Prusa MK4/MK3/MINI) do not read
+  exFAT or NTFS. A >32 GiB stick that shipped exFAT comes back readable, it just
+  takes longer to lay down (~7.5 MiB of FAT for 128 GB, ~31 s on the test stick).
+* Ceiling is 2 TiB: `WRITE(10)` and the FAT32 partition table are 32-bit sector
+  counts. Anything bigger is out of scope for this firmware.
 * One drive at a time; a second MSC device behind a hub is ignored while a
   sanitize run is in progress.
 * Powering down is total: the USB-A rail is off, so **inserting a drive does

@@ -10,8 +10,8 @@
  * it sanitizes whatever is in the port, and it goes dark again.
  *
  * Strategy (destructive by design, but a metadata rewrite, not a full erase):
- *   - Only drives up to 32 GiB are accepted: that is the range where FAT32 is
- *     the expected file system. Larger drives are refused untouched.
+ *   - Any drive size is accepted. Above 32 GiB, where a drive no longer ships
+ *     FAT32, the LED shows magenta for a moment before the wipe starts.
  *   - Enumerate the mass storage device through TinyUSB host (tuh_msc).
  *   - Emit a fresh, valid FAT32 file system directly with SCSI WRITE(10):
  *     MBR, boot sector, FSInfo, backup boot sectors, one FAT and an empty
@@ -116,21 +116,25 @@
 // whole range, so these transfers legitimately take seconds on slow media.
 #define FLUSH_TIMEOUT_MS 30000u
 
-// Hard upper bound for the whole operation. A 32 GiB stick needs ~2 MiB of
-// metadata, which is ~9 s at the ~244 KiB/s this stick writes, so the old 15 s
-// was uncomfortably close.
-#define WIPE_TIMEOUT_MS 30000u
+// Backstop for the whole operation, scaled with the amount of metadata: the
+// biggest FAT this can build is ~8 MiB per 128 GiB of drive, and cheap sticks
+// write at ~100 KiB/s. A fixed bound would either be too tight for a big drive
+// or useless for a small one. A wedge is actually caught by XFER_TIMEOUT_MS per
+// chunk; this only catches a wipe that runs away without failing a chunk.
+#define WIPE_TIMEOUT_BASE_MS 15000u
+#define WIPE_MIN_BYTES_PER_MS 100u // ~100 KiB/s
 
 #define MAX_BLOCK_SIZE 4096u
 
 // Number of LBAs read back after the wipe (start / middle / end).
 #define VERIFY_POINTS 3
 
-// Largest drive we agree to sanitize: 32 GiB is where FAT32 stops being the
-// file system a drive is expected to carry (Microsoft's formatter refuses to
-// create FAT32 above it). Bigger drives are refused untouched instead of being
-// given a file system nobody expects.
-#define MAX_DEVICE_BYTES (32ull * 1024ull * 1024ull * 1024ull)
+// Above this size a drive no longer ships FAT32 (Windows will not create one
+// that big), so the wipe is worth announcing: such a drive gets a magenta
+// heads-up before the blue writes start. It is cleaned exactly like any other -
+// 32 GiB is where being an ordinary FAT32 stick ends, not a limit.
+#define LARGE_DRIVE_BYTES (32ull * 1024ull * 1024ull * 1024ull)
+#define LARGE_NOTICE_MS 2000u
 
 // How long the result colour stays on before the board powers down.
 #define RESULT_HOLD_MS 2500u
@@ -152,7 +156,7 @@ typedef enum {
   STATUS_IDLE = 0, // yellow pulsing
   STATUS_WIPING,   // blue blinking
   STATUS_DONE,     // green solid
-  STATUS_REFUSED,  // magenta blinking
+  STATUS_LARGE,    // magenta blinking: drive over LARGE_DRIVE_BYTES
   STATUS_ERROR,    // red solid
 } status_t;
 
@@ -248,8 +252,8 @@ static void status_led_task(void) {
       led_on = true;
       break;
 
-    case STATUS_REFUSED: {
-      // Slow magenta blink: "nothing was done, and that was on purpose".
+    case STATUS_LARGE: {
+      // Slow magenta blink: "heads-up, this one is big".
       const bool on = ((now_ms / 250u) & 1u) != 0;
       r = on ? 200 : 0;
       b = on ? 255 : 0;
@@ -296,7 +300,7 @@ typedef enum {
   WIPE_SYNC,
   WIPE_VERIFY,
   WIPE_DONE,
-  WIPE_REFUSED,
+  WIPE_LARGE, // heads-up colour before writing a drive over 32 GiB
   WIPE_ERROR,
 } wipe_state_t;
 
@@ -323,6 +327,7 @@ static uint32_t fs_cursor = 0;         // sectors of the region written
 static uint16_t chunk_sectors = 0;     // sectors per WRITE(10)
 static uint32_t bytes_written = 0;     // for the throughput report
 static uint32_t wipe_started_us = 0;
+static uint32_t wipe_timeout_ms = 0; // scaled with the metadata size
 static uint32_t xfer_started_us = 0;
 static uint16_t inflight_sectors = 0;
 static uint8_t retry_count = 0;
@@ -406,21 +411,6 @@ static void wipe_fail(const char *fmt, ...) {
   wipe_set_status(STATUS_ERROR);
 }
 
-// A deliberate "not this drive": nothing was written, so this is not a
-// failure, just a drive we do not support.
-static void wipe_refuse(const char *fmt, ...) {
-  char msg[96];
-  va_list args;
-  va_start(args, fmt);
-  vsnprintf(msg, sizeof(msg), fmt, args);
-  va_end(args);
-
-  printf("REFUSED: %s\n", msg);
-  wipe_set_state(WIPE_REFUSED);
-  xfer_state = XFER_IDLE;
-  wipe_set_status(STATUS_REFUSED);
-}
-
 // Back to "nothing to do": used when the drive goes away and by the state
 // machine's default branch. power_service() takes it from here.
 static void wipe_reset_to_idle(void) {
@@ -476,8 +466,9 @@ void tuh_msc_mount_cb(uint8_t dev_addr) {
 
   // One drive at a time: ignore a second MSC device (e.g. behind a hub) while
   // a wipe is already running.
-  if (wipe_state == WIPE_PREPARE || wipe_state == WIPE_WRITE ||
-      wipe_state == WIPE_SYNC || wipe_state == WIPE_VERIFY) {
+  if (wipe_state == WIPE_PREPARE || wipe_state == WIPE_LARGE ||
+      wipe_state == WIPE_WRITE || wipe_state == WIPE_SYNC ||
+      wipe_state == WIPE_VERIFY) {
     return;
   }
 
@@ -517,16 +508,6 @@ static void wipe_prepare(void) {
     return;
   }
 
-  // FAT32 territory only. A 64 GiB stick is exFAT for a reason: the file
-  // system we write would not be what any OS or device expects there.
-  const uint64_t capacity_bytes = (uint64_t)msc_block_count * (uint64_t)msc_block_size;
-  if (capacity_bytes > MAX_DEVICE_BYTES) {
-    wipe_refuse("%lu MiB drive, this cleaner handles up to %lu MiB (FAT32)",
-                (unsigned long)(capacity_bytes >> 20),
-                (unsigned long)(MAX_DEVICE_BYTES >> 20));
-    return;
-  }
-
   const uint32_t bs = msc_block_size;
   if (bs != 512u) {
     wipe_fail("unsupported block size %lu B (the FAT32 builder needs 512)",
@@ -556,11 +537,19 @@ static void wipe_prepare(void) {
   inflight_sectors = 0;
   sync_unsupported = false;
   xfer_state = XFER_IDLE;
-  wipe_started_us = time_us_32();
   memset(zero_buf, 0, sizeof(zero_buf));
 
-  printf("Sanitize: rebuilding FAT32 '%s' on %lu MiB\n",
-         FS_LABEL, (unsigned long)(msc_block_count / 2048u));
+  // The backstop has to grow with the FAT: 8 MiB of metadata is legitimate on a
+  // 128 GiB drive and takes ~40 s on a cheap stick.
+  wipe_timeout_ms = WIPE_TIMEOUT_BASE_MS +
+                    (fs_region_sectors * 512u) / WIPE_MIN_BYTES_PER_MS;
+
+  const uint64_t capacity_bytes = (uint64_t)msc_block_count * (uint64_t)bs;
+  const bool large = capacity_bytes > LARGE_DRIVE_BYTES;
+
+  printf("Sanitize: rebuilding FAT32 '%s' on %lu MiB%s\n",
+         FS_LABEL, (unsigned long)(msc_block_count / 2048u),
+         large ? " (large drive)" : "");
   printf("  partition LBA %lu..%lu, %lu KiB clusters, 1 FAT of %lu KiB\n",
          (unsigned long)fs_layout.part_start_lba,
          (unsigned long)(fs_layout.part_start_lba + fs_layout.part_sectors - 1u),
@@ -575,6 +564,16 @@ static void wipe_prepare(void) {
   verify_lbas[1] = fs_layout.part_start_lba;         // boot sector
   verify_lbas[2] = fs_layout.part_start_lba + fs_layout.reserved_sectors; // FAT
 
+  if (large) {
+    // Magenta for a moment: this is one of the big ones. The write itself
+    // starts from WIPE_LARGE below, so the timing still covers only the writes.
+    wipe_set_status(STATUS_LARGE);
+    wipe_set_state(WIPE_LARGE);
+    return;
+  }
+
+  wipe_set_status(STATUS_WIPING);
+  wipe_started_us = time_us_32();
   wipe_set_state(WIPE_WRITE);
 }
 
@@ -636,7 +635,7 @@ static void wipe_service(void) {
         return;
       }
 
-      if (ms_since(wipe_started_us) > WIPE_TIMEOUT_MS) {
+      if (ms_since(wipe_started_us) > wipe_timeout_ms) {
         wipe_fail("overall timeout after %lu ms", (unsigned long)ms_since(wipe_started_us));
         return;
       }
@@ -799,9 +798,17 @@ static void wipe_service(void) {
       return;
     }
 
-    case WIPE_REFUSED:
-      // Nothing to do: the result colour is on the LED and the sleep service
-      // below takes over once it has been shown for long enough.
+    case WIPE_LARGE:
+      // Heads-up colour shown; start writing once it has had its moment.
+      if (msc_dev_addr == 0 || !tuh_msc_mounted(msc_dev_addr)) {
+        wipe_fail("drive disappeared before the wipe started");
+        return;
+      }
+      if (ms_since(state_since_us) >= LARGE_NOTICE_MS) {
+        wipe_set_status(STATUS_WIPING);
+        wipe_started_us = time_us_32();
+        wipe_set_state(WIPE_WRITE);
+      }
       return;
 
     default:
@@ -891,8 +898,7 @@ static void power_off(void) {
 static void power_service(void) {
   const bool idle = (wipe_state == WIPE_IDLE) && (msc_dev_addr == 0) &&
                     (pending_mount_addr == 0);
-  const bool result = (wipe_state == WIPE_DONE) || (wipe_state == WIPE_ERROR) ||
-                      (wipe_state == WIPE_REFUSED);
+  const bool result = (wipe_state == WIPE_DONE) || (wipe_state == WIPE_ERROR);
   if (!idle && !result) {
     return;
   }
@@ -987,8 +993,8 @@ static bool msc_read_blocking(uint32_t lba, uint16_t sectors, void *buf) {
 // bottleneck.
 static void read_throughput_test(void) {
   if (msc_dev_addr == 0 || msc_block_size == 0 || !tuh_msc_mounted(msc_dev_addr) ||
-      wipe_state == WIPE_PREPARE || wipe_state == WIPE_WRITE ||
-      wipe_state == WIPE_SYNC ||
+      wipe_state == WIPE_PREPARE || wipe_state == WIPE_LARGE ||
+      wipe_state == WIPE_WRITE || wipe_state == WIPE_SYNC ||
       wipe_state == WIPE_VERIFY) {
     printf("Read test needs a mounted, idle drive\n");
     return;
@@ -1058,7 +1064,7 @@ static void console_service(void) {
   }
   if (msc_dev_addr != 0 && tuh_msc_mounted(msc_dev_addr) &&
       (wipe_state == WIPE_IDLE || wipe_state == WIPE_DONE ||
-       wipe_state == WIPE_REFUSED || wipe_state == WIPE_ERROR)) {
+       wipe_state == WIPE_ERROR)) {
     printf("Re-running wipe on device address %u\n", (unsigned)msc_dev_addr);
     wipe_set_state(WIPE_PREPARE);
   }
@@ -1085,8 +1091,8 @@ int main(void) {
          (unsigned)BOARD_USB_5V_EN_PIN);
   printf("Output: fresh empty FAT32 labelled '%s', 1 FAT, big clusters\n",
          FS_LABEL);
-  printf("Limits: drives up to %lu MiB (FAT32 range)\n",
-         (unsigned long)(MAX_DEVICE_BYTES >> 20));
+  printf("Size: no limit; drives over %lu MiB show magenta first, then blue\n",
+         (unsigned long)(LARGE_DRIVE_BYTES >> 20));
   printf("Ready - insert a USB flash drive...\n");
   printf("Powers down after %lu ms without a drive, or %lu ms after a result.\n",
          (unsigned long)IDLE_SLEEP_MS, (unsigned long)RESULT_HOLD_MS);
