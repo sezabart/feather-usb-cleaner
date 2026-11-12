@@ -143,11 +143,50 @@ the board**. Plug the drive in, press RST, watch the LED.
 The clock surgery is adapted from `pico-extras`' `pico_sleep` (XOSC only, no
 PLLs), kept in `main.c` so the project does not need a second SDK checkout.
 
-One thing is deliberately *not* a power-down: while a console is open
-(`stdio_usb_connected()`, i.e. DTR up on the USB-C CDC port) the board stays
-awake so a workbench session keeps its log — the CDC link does not survive
-DORMANT anyway. Close the monitor and it powers down; on battery there is no
-console, so it always does.
+**When it does *not* power down:** anything that means desk power keeps it awake
+indefinitely — the board being enumerated by a USB host (`tud_mounted()`: a PC,
+laptop or powered hub) or a console being open (`stdio_usb_connected()`, DTR up,
+since the CDC link does not survive DORMANT anyway). A dumb 5 V brick is
+invisible on an unmodified board; see *Sensing USB-C power* below if you want
+that case too.
+
+### Battery life
+
+0.74 Wh LiPo (200 mAh), firmware as it is:
+
+| State | Current (battery side) | Cost |
+|---|---|---|
+| Powered down (DORMANT, rails and LED off) | ~1.3–1.6 mA | ~35 mAh/day |
+| Wiping 120 GiB (31 s) | ~60–70 mA | ~0.6 mAh per run |
+| Wiping 16 GiB (~6 s) | ~60–70 mA | ~0.1 mAh per run |
+
+So **standby is the whole budget: roughly 5–6 days on a 0.74 Wh cell**, against
+several hundred wipes' worth of charge. An RP2040 cannot go below DORMANT while
+still being wakeable, so for a longer shelf life either use a bigger cell
+(linear: 2000 mAh ≈ 8 weeks) or a switch on the battery leads — waking is a
+button press anyway, so there is nothing to lose.
+
+### Sensing USB-C power (optional, two resistors)
+
+`VBUS` on this board goes only to the charger and the load-share FET — there is
+no divider to an ADC pin, so a dumb charger cannot be seen. Add one and the
+firmware stays awake on *any* USB-C power:
+
+```
+USB (5 V, power header pin 3) ──[100k]──┬── A0 / GP26
+                                      │
+                                   [100k]
+                                      │
+                                     GND
+```
+
+Then uncomment `#define USB_POWER_SENSE_PIN 26` at the top of `main.c`.
+`A0` reads ~2.5 V on USB-C power and 0 V on battery (threshold 1.2 V), and the
+`s` console key reports `USB pwr 1|0`. Do not enable it on an unmodified board:
+a floating `A0` reads noise and the board would never sleep.
+
+Note `BAT` is *not* usable for this: it sits at 3.0–4.2 V whether or not USB-C is
+plugged in, and only moves while the cell is actually charging.
 
 ---
 
@@ -325,6 +364,7 @@ At the top of `main.c`:
 | `LARGE_NOTICE_MS` | 2000 | How long that heads-up lasts before writing |
 | `IDLE_SLEEP_MS` | 5000 | Awake time with nothing mounted before powering down |
 | `NO_ENUM_MS` | 4000 | How long an attached drive gets to enumerate before it counts as unsupported |
+| `USB_POWER_SENSE_PIN` | undefined | ADC pin of the optional VBUS divider (A0 = 26); undefined = infer USB power from enumeration |
 | `BUS_SENSE_MS` | 400 | Boot-time wait for a drive's pull-up after the port powers up |
 | `RESULT_HOLD_MS` | 2500 | How long the result colour stays on before powering down |
 | `CONSOLE_WAIT_MS` | 1500 | Boot-time wait for the USB-C console to attach |

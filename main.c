@@ -147,6 +147,21 @@
 // call it unrecognised.
 #define NO_ENUM_MS 4000u
 
+// Optional hardware: this board wires USB-C VBUS only to the charger and the
+// load-share FET, so there is nothing to *see* USB-C power from the RP2040. The
+// most it can tell is "a USB host enumerated me", which misses dumb chargers.
+// Fit a 2x100k divider from the Feather's USB (VBUS) pin to A0 and define the
+// pin below to sense real USB-C power (2.5 V on USB, 0 V on battery). Leave it
+// undefined on an unmodified board: a floating A0 reads noise, and that would
+// keep the board awake forever.
+// #define USB_POWER_SENSE_PIN 26 // A0
+
+#ifdef USB_POWER_SENSE_PIN
+#include "hardware/adc.h"
+#define USB_POWER_SENSE_ADC_INPUT 0
+#define USB_POWER_SENSE_THRESHOLD 1500u // ~1.2 V of 3.3 V over 4095
+#endif
+
 // How long the boot-time bus sense waits for a drive to show its pull-up after
 // it sees VBUS. Older drives are slow to start.
 #define BUS_SENSE_MS 400u
@@ -943,8 +958,33 @@ static void presence_service(void) {
   wipe_set_state(WIPE_IDLE);
 }
 
-// Called from the main loop. Returns only while a console is open; otherwise
-// the board powers down for good.
+static void usb_power_sense_init(void) {
+#ifdef USB_POWER_SENSE_PIN
+  adc_init();
+  adc_gpio_init(USB_POWER_SENSE_PIN);
+#endif
+}
+
+// True when the board is running from USB-C. Without the optional ADC divider
+// the best we can do is "a USB host enumerated us" (PC, laptop, powered hub) or
+// an open console - a dumb charger is invisible, and the board powers down on
+// it just like on battery.
+static bool usb_power_present(void) {
+#ifdef USB_POWER_SENSE_PIN
+  adc_select_input(USB_POWER_SENSE_ADC_INPUT);
+  uint32_t sum = 0;
+  for (int i = 0; i < 4; i++) {
+    sum += adc_read();
+  }
+  if ((sum / 4u) > USB_POWER_SENSE_THRESHOLD) {
+    return true;
+  }
+#endif
+  return tud_mounted() || stdio_usb_connected();
+}
+
+// Called from the main loop. Returns when the board runs on USB-C power (it then
+// stays awake); otherwise it powers down for good.
 static void power_service(void) {
   const bool idle = (wipe_state == WIPE_IDLE) && (msc_dev_addr == 0) &&
                     (pending_mount_addr == 0);
@@ -958,9 +998,9 @@ static void power_service(void) {
     return;
   }
 
-  // An open console (DTR up) means somebody is watching: stay awake so the log
-  // is not cut short. On battery nobody is listening, so the board goes dark.
-  if (stdio_usb_connected()) {
+  // On USB-C power the board never powers down: a desk/bench session should not
+  // be cut short, and going dark mid-test only means a trip to the reset button.
+  if (usb_power_present()) {
     return;
   }
 
@@ -1119,13 +1159,14 @@ static void console_service(void) {
     // Raw bus state: if D+ is high the drive is powered and pulling up, so a
     // missing mount means enumeration failed; a low D+ means nothing is there
     // (no power, bad contact, or no device).
-    printf("Host %s | D+=%u D-=%u | MSC %s addr %u | state %d | boot sense D+=%u D-=%u\n",
+    printf("Host %s | D+=%u D-=%u | MSC %s addr %u | state %d | boot sense D+=%u D-=%u | USB pwr %u\n",
            tuh_inited() ? "up" : "down",
            (unsigned)gpio_get(BOARD_USB_HOST_DP_PIN),
            (unsigned)gpio_get(BOARD_USB_HOST_DM_PIN),
            (msc_dev_addr != 0 && tuh_msc_mounted(msc_dev_addr)) ? "mounted" : "none",
            (unsigned)msc_dev_addr, (int)wipe_state,
-           (unsigned)sense_dp_high, (unsigned)sense_dm_high);
+           (unsigned)sense_dp_high, (unsigned)sense_dm_high,
+           (unsigned)usb_power_present());
     return;
   }
 
@@ -1169,6 +1210,7 @@ int main(void) {
   stdio_init_all();
 
   status_led_init();
+  usb_power_sense_init();
   console_wait(CONSOLE_WAIT_MS);
 
   printf("\n");
